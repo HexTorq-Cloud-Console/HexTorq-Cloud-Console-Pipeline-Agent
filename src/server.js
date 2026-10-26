@@ -10,6 +10,7 @@ const agentId = process.env.AGENT_ID;
 const agentKey = process.env.AGENT_API_KEY;
 const consoleUrl = process.env.CONSOLE_URL?.replace(/\/$/, '');
 const pipelineUrl = process.env.PIPELINE_URL?.replace(/\/$/, '');
+const publicPipelineUrl = process.env.PIPELINE_PUBLIC_URL?.replace(/\/$/, '');
 const allowedProcesses = new Set((process.env.ALLOWED_PM2_PROCESSES || '').split(',').map((value) => value.trim()).filter(Boolean));
 
 if (!agentId || !agentKey || !consoleUrl || !pipelineUrl) throw new Error('AGENT_ID, AGENT_API_KEY, CONSOLE_URL, and PIPELINE_URL are required');
@@ -44,6 +45,15 @@ function runPm2(args) {
 
 app.get('/health', (_req, res) => res.json({ status: 'ok', agentId, allowedProcesses: allowedProcesses.size }));
 
+app.get('/pm2/processes', requireConsole, async (_req, res) => {
+  const result = await runPm2(['jlist']);
+  if (!result.ok) return res.status(502).json({ message: 'Unable to read PM2 processes', ...result });
+  try {
+    const processes = JSON.parse(result.output).map((process) => ({ name: process.name, id: process.pm_id, status: process.pm2_env?.status })).filter((process) => process.name && allowedProcesses.has(process.name));
+    res.json({ processes });
+  } catch { res.status(502).json({ message: 'Invalid PM2 process response' }); }
+});
+
 app.get('/pm2/status/:target', requireConsole, async (req, res) => {
   if (!/^[a-zA-Z0-9_.-]+$/.test(req.params.target) || !allowedProcesses.has(req.params.target)) return res.status(403).json({ message: 'PM2 process is not allowed for this agent' });
   const result = await runPm2(['jlist']);
@@ -58,7 +68,17 @@ app.get('/pm2/status/:target', requireConsole, async (req, res) => {
 
 app.post('/webhook/:project', requireConsole, async (req, res) => {
   try {
-    const response = await fetch(`${pipelineUrl}/webhook/${encodeURIComponent(req.params.project)}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(req.body) });
+    const configuredUrl = req.body?.service?.webhookUrl;
+    const defaultUrl = `${pipelineUrl}/webhook/${encodeURIComponent(req.params.project)}`;
+    let targetUrl = defaultUrl;
+    if (configuredUrl) {
+      const target = new URL(configuredUrl);
+      const allowedBases = [pipelineUrl, publicPipelineUrl].filter(Boolean).map((value) => new URL(value));
+      const allowed = allowedBases.some((base) => target.origin === base.origin && target.pathname.startsWith(`${base.pathname}/`));
+      if (!allowed) return res.status(400).json({ message: 'Webhook URL is not allowed for this agent pipeline' });
+      targetUrl = target.toString();
+    }
+    const response = await fetch(targetUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(req.body) });
     res.status(response.status).send(await response.text());
   } catch (error) { res.status(502).json({ message: 'Pipeline webhook forwarding failed', error: error.message }); }
 });
