@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import helmet from 'helmet';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
 import { spawn } from 'node:child_process';
 
 const app = express();
@@ -12,6 +13,11 @@ const consoleUrl = process.env.CONSOLE_URL?.replace(/\/$/, '');
 const pipelineUrl = process.env.PIPELINE_URL?.replace(/\/$/, '');
 const publicPipelineUrl = process.env.PIPELINE_PUBLIC_URL?.replace(/\/$/, '');
 const allowedProcesses = new Set((process.env.ALLOWED_PM2_PROCESSES || '').split(',').map((value) => value.trim()).filter(Boolean));
+const dynamicProcessesFile = process.env.DYNAMIC_PROCESSES_FILE || './dynamic-processes.json';
+
+try {
+  for (const processName of JSON.parse(fs.readFileSync(dynamicProcessesFile, 'utf8'))) allowedProcesses.add(processName);
+} catch { /* Dynamic process registrations are recreated by the console after restart. */ }
 
 if (!agentId || !agentKey || !consoleUrl || !pipelineUrl) throw new Error('AGENT_ID, AGENT_API_KEY, CONSOLE_URL, and PIPELINE_URL are required');
 
@@ -41,6 +47,14 @@ function runPm2(args) {
     child.on('error', (reason) => resolve({ ok: false, output, error: reason.message }));
     child.on('close', (code) => resolve({ ok: code === 0, output, error, code }));
   });
+}
+
+function registerDynamicProcess(processName) {
+  if (!processName || !/^[a-zA-Z0-9_.-]+$/.test(processName)) return;
+  allowedProcesses.add(processName);
+  try {
+    fs.writeFileSync(dynamicProcessesFile, JSON.stringify([...allowedProcesses].sort(), null, 2));
+  } catch { /* The allowlist remains active in memory for this process. */ }
 }
 
 app.get('/health', (_req, res) => res.json({ status: 'ok', agentId, allowedProcesses: allowedProcesses.size }));
@@ -81,6 +95,24 @@ app.post('/webhook/:project', requireConsole, async (req, res) => {
     const response = await fetch(targetUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(req.body) });
     res.status(response.status).send(await response.text());
   } catch (error) { res.status(502).json({ message: 'Pipeline webhook forwarding failed', error: error.message }); }
+});
+
+app.post('/projects/register', requireConsole, async (req, res) => {
+  try {
+    if (req.body?.pm2ProcessName) registerDynamicProcess(req.body.pm2ProcessName);
+    const response = await fetch(`${pipelineUrl}/projects/register`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Console-Agent-Id': agentId,
+        'X-Console-Agent-Key': agentKey,
+      },
+      body: JSON.stringify(req.body),
+    });
+    res.status(response.status).send(await response.text());
+  } catch (error) {
+    res.status(502).json({ message: 'Pipeline project registration failed', error: error.message });
+  }
 });
 
 app.get('/pm2/logs/:target/stream', requireConsole, async (req, res) => {
